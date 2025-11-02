@@ -5,16 +5,39 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 import numpy as np, pandas as pd
 
-# Optional UI/quotes deps
+# UI deps
 try:
     import streamlit as st
     import plotly.graph_objects as go
-    import yfinance as yf
     import requests
 except Exception:
-    st = None; go = None; yf = None; requests = None
+    st = None; go = None; requests = None
 
-MULTIPLIER = 100  # contract size
+# -------- OpenAPI SDK import (Moomoo/Futu) --------
+OpenQuoteContext = None
+RET_OK = -1
+
+class _SubTypeShim:  # avoids NameError if SDK missing
+    QUOTE = object()
+
+SubType = _SubTypeShim
+
+# moomoo (some envs ship the SDK under this name)
+try:
+    from moomoo import OpenQuoteContext as _MQC, RET_OK as _RET, SubType as _ST
+    OpenQuoteContext, RET_OK, SubType = _MQC, _RET, _ST
+except Exception:
+    pass
+
+# futu-api (official pip pkg name)
+if OpenQuoteContext is None:
+    try:
+        from futu import OpenQuoteContext as _FQC, RET_OK as _FRET, SubType as _FST
+        OpenQuoteContext, RET_OK, SubType = _FQC, _FRET, _FST
+    except Exception:
+        pass
+
+MULTIPLIER = 100  # contracts
 
 # ===================== Models =====================
 @dataclass
@@ -24,7 +47,7 @@ class OptionLeg:
     kind: str        # "C" or "P"
     strike: float
     qty: int         # +long / -short
-    avg_cost: float  # premium per contract
+    avg_cost: float  # premium/contract
     name: str = ""
     source_id: Optional[str] = None
 
@@ -74,26 +97,20 @@ def parse_moomoo_positions(df: pd.DataFrame) -> Tuple[List[Strategy], List[Optio
     missing = EXPECTED_COLUMNS - set(df.columns)
     if missing:
         raise ValueError(f"CSV missing columns: {missing}")
-
     strategies: Dict[str, Strategy] = {}
     legs: List[OptionLeg] = []
-
     for _, row in df.iterrows():
         symbol = str(row["Symbol"]).strip()
         name = str(row.get("Name", "")).strip()
         qty = int(float(row["Quantity"]))
         avg = float(row.get("Average Cost", 0.0))
-
-        # Skip spread header (legs appear as separate rows)
         if SPREAD_SYMBOL_RE.match(symbol):
             if name and name not in strategies:
                 strategies[name] = Strategy(name, [], True, "current")
             continue
-
         m = LEG_SYMBOL_RE.match(symbol.replace(" ", "")) or (LEG_SYMBOL_RE.match(name.replace(" ", "")) if name else None)
         if not m:
             continue
-
         leg = OptionLeg(
             ticker=m.group("ticker"),
             expiry=parse_expiry(m.group("expiry")),
@@ -105,13 +122,11 @@ def parse_moomoo_positions(df: pd.DataFrame) -> Tuple[List[Strategy], List[Optio
             source_id=symbol,
         )
         legs.append(leg)
-
         if name:
             strategies.setdefault(name, Strategy(name, [], True, "current")).legs.append(leg)
         else:
             sname = f"{leg.ticker} {leg.expiry} {leg.kind}{leg.strike:g} Single"
             strategies[sname] = Strategy(sname, [leg], True, "current")
-
     return list(strategies.values()), legs
 
 # ===================== Math helpers =====================
@@ -167,196 +182,104 @@ def build_iron_butterfly(t, exp, center_k, put_wing, call_wing, qty, credit, tag
         OptionLeg(t, exp, "C", call_wing, +abs(qty), 0.0),
     ], True, tag)
 
-# ===================== Quotes =====================
+# ===================== Providers (Yahoo removed) =====================
 class QuoteProvider:
-    Yahoo   = "Yahoo Finance (yfinance)"
+    Moomoo = "Moomoo/Futu OpenAPI (OpenD)"
     Tradier = "Tradier"
     Polygon = "Polygon.io"
-    Moomoo  = "Moomoo (custom stub)"
 
-def normalize_symbol_for_yahoo(t: str) -> str:
-    return t.strip().upper().replace(" ", "").replace(".", "-")
+def _mm_symbol(ticker: str) -> str:
+    return f"US.{ticker.strip().upper()}"
 
-def _safe_float(v):
+MOOMOO_DEFAULT_HOST = "127.0.0.1"
+MOOMOO_DEFAULT_QUOTE_PORT = 11111
+
+def _with_moomoo_quote_ctx(host: str, port: int):
+    if OpenQuoteContext is None:
+        raise RuntimeError("OpenAPI SDK missing. Install: pip install futu-api")
+    return OpenQuoteContext(host=host or MOOMOO_DEFAULT_HOST, port=port or MOOMOO_DEFAULT_QUOTE_PORT)
+
+def moomoo_fetch_spot(ticker: str, host: str, port: int) -> Optional[float]:
+    code = _mm_symbol(ticker)
+    ctx = _with_moomoo_quote_ctx(host, port)
     try:
-        import numpy as _np
-        if v is None: return None
-        if isinstance(v, float) and _np.isnan(v): return None
-        return float(v)
-    except Exception:
+        ret, _ = ctx.subscribe(code, SubType.QUOTE, push=False)
+        if ret != RET_OK:
+            return None
+        ret, df = ctx.get_stock_quote(code)
+        if ret != RET_OK or df is None or df.empty:
+            return None
+        for col in ("last_price", "cur_price"):
+            if col in df.columns and pd.notna(df[col].iloc[0]):
+                return float(df[col].iloc[0])
         return None
+    finally:
+        ctx.close()
 
-if st:
-    @st.cache_data(ttl=300, show_spinner=False)
-    def yahoo_available_expiries(ticker: str) -> List[str]:
-        try:
-            return list((yf.Ticker(normalize_symbol_for_yahoo(ticker)).options) or [])
-        except Exception:
+def moomoo_get_available_strikes(ticker: str, expiry: dt.date, host: str, port: int) -> List[float]:
+    code = _mm_symbol(ticker)
+    ctx = _with_moomoo_quote_ctx(host, port)
+    try:
+        ret, exps = ctx.get_option_expiration_date(code=code)
+        if ret != RET_OK or exps is None or exps.empty:
             return []
+        exps = exps.copy()
+        exps["d"] = pd.to_datetime(exps["strike_time"]).dt.date
+        want = min(exps["d"], key=lambda d: abs((d - expiry).days))
+        ret, chain = ctx.get_option_chain(code=code, start=want.strftime("%Y-%m-%d"), end=want.strftime("%Y-%m-%d"))
+        if ret != RET_OK or chain is None or chain.empty:
+            return []
+        strikes = chain["strike_price"].astype(float).unique().tolist()
+        return sorted(set(map(float, strikes)))
+    finally:
+        ctx.close()
 
-    def _nearest_expiry_str(ticker: str, want: dt.date) -> Optional[str]:
-        exps = yahoo_available_expiries(ticker)
-        if not exps:
+def moomoo_fetch_option_mid(ticker: str, expiry: dt.date, kind: str, strike: float, host: str, port: int) -> Optional[float]:
+    code = _mm_symbol(ticker)
+    ctx = _with_moomoo_quote_ctx(host, port)
+    try:
+        ret, exps = ctx.get_option_expiration_date(code=code)
+        if ret != RET_OK or exps is None or exps.empty:
             return None
-        def to_date(s): y,m,d = map(int, s.split("-")); return dt.date(y,m,d)
-        return min(exps, key=lambda s: abs((to_date(s) - want).days))
-
-    @st.cache_data(ttl=300, show_spinner=False)
-    def get_available_strikes(provider: str, ticker: str, expiry: dt.date,
-                              api_key: str = "", moomoo_cookie: str = "") -> List[float]:
-        strikes: List[float] = []
-        try:
-            if provider == QuoteProvider.Yahoo and yf:
-                tk = normalize_symbol_for_yahoo(ticker)
-                t  = yf.Ticker(tk)
-                exps = t.options or []
-                if not exps:
-                    return strikes
-                def to_date(s): y,m,d = map(int, s.split("-")); return dt.date(y,m,d)
-                exp_str = min(exps, key=lambda s: abs((to_date(s) - expiry).days))
-                chain = t.option_chain(exp_str)
-                if chain and getattr(chain, "calls", None) is not None and not chain.calls.empty:
-                    strikes.extend(chain.calls["strike"].astype(float).tolist())
-                if chain and getattr(chain, "puts", None) is not None and not chain.puts.empty:
-                    strikes.extend(chain.puts["strike"].astype(float).tolist())
-                return sorted(set(strikes))
-        except Exception:
-            return strikes
-        return strikes
-
-    @st.cache_data(ttl=90, show_spinner=False)
-    def fetch_spot(provider: str, ticker: str, api_key: str = "", moomoo_cookie: str = "") -> Tuple[Optional[float], str]:
-        """
-        Returns (price, source) or (None, reason).
-        Robust fallbacks for Yahoo; simple for others.
-        """
-        try:
-            if provider == QuoteProvider.Yahoo and yf:
-                tk = normalize_symbol_for_yahoo(ticker)
-                t  = yf.Ticker(tk)
-
-                # 1) fast_info
-                try:
-                    fi = t.fast_info
-                    for k in ("last_price", "regularMarketPrice", "last", "lastPrice"):
-                        v = _safe_float(fi.get(k) if hasattr(fi, "get") else getattr(fi, k, None))
-                        if v and v > 0:
-                            return v, f"fast_info.{k}"
-                except Exception:
-                    pass
-
-                # 2) info
-                try:
-                    info = t.info or {}
-                    for k in ("regularMarketPrice", "currentPrice", "previousClose"):
-                        v = _safe_float(info.get(k))
-                        if v and v > 0:
-                            return v, f"info.{k}"
-                except Exception:
-                    pass
-
-                # 3) 1d history Close
-                try:
-                    h = t.history(period="1d")
-                    if not h.empty and _safe_float(h["Close"].iloc[-1]):
-                        return float(h["Close"].iloc[-1]), "history(1d).Close"
-                except Exception:
-                    pass
-
-                # 4) 5d history last valid Close
-                try:
-                    h5 = t.history(period="5d")
-                    if not h5.empty and _safe_float(h5["Close"].dropna().iloc[-1]):
-                        return float(h5["Close"].dropna().iloc[-1]), "history(5d).Close(last valid)"
-                except Exception:
-                    pass
-
-                # 5) download 5d/1d
-                try:
-                    d5 = yf.download(tk, period="5d", interval="1d", progress=False, threads=False)
-                    if not d5.empty and _safe_float(d5["Close"].dropna().iloc[-1]):
-                        return float(d5["Close"].dropna().iloc[-1]), "download(5d,1d)"
-                except Exception:
-                    pass
-
-                # 6) download 1d/1m (last tick)
-                try:
-                    d1m = yf.download(tk, period="1d", interval="1m", progress=False, threads=False)
-                    if not d1m.empty and _safe_float(d1m["Close"].dropna().iloc[-1]):
-                        return float(d1m["Close"].dropna().iloc[-1]), "download(1d,1m)"
-                except Exception:
-                    pass
-
-                return None, "no_yahoo_price"
-
-            if provider == QuoteProvider.Tradier and requests:
-                r = requests.get(
-                    "https://api.tradier.com/v1/markets/quotes",
-                    params={"symbols": ticker},
-                    headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"},
-                    timeout=8
-                ); r.raise_for_status()
-                return float(r.json()["quotes"]["quote"]["last"]), "tradier.last"
-
-            if provider == QuoteProvider.Polygon and requests:
-                r = requests.get(f"https://api.polygon.io/v2/last/trade/{ticker}",
-                                 params={"apiKey": api_key}, timeout=8); r.raise_for_status()
-                return float(r.json()["results"]["p"]), "polygon.last_trade"
-
-            return None, "unsupported_provider"
-        except Exception as e:
-            return None, f"error:{e}"
-
-    @st.cache_data(ttl=300, show_spinner=False)
-    def fetch_option_mid(provider: str, ticker: str, expiry: dt.date, kind: str, strike: float,
-                         api_key: str = "", moomoo_cookie: str = "") -> Optional[float]:
-        try:
-            if provider == QuoteProvider.Yahoo and yf:
-                tk = normalize_symbol_for_yahoo(ticker)
-                t  = yf.Ticker(tk)
-                exp = _nearest_expiry_str(ticker, expiry)
-                if not exp:
-                    return None
-                try:
-                    chain = t.option_chain(exp)
-                except Exception:
-                    return None
-                tbl = chain.calls if kind == "C" else chain.puts
-                if tbl is None or tbl.empty:
-                    return None
-                row = tbl.iloc[(tbl["strike"] - strike).abs().argsort()[:1]]
-                bid = _safe_float(row["bid"].iloc[0]); ask = _safe_float(row["ask"].iloc[0])
-                last = _safe_float(row.get("lastPrice", pd.Series([np.nan])).iloc[0])
-                if bid and ask and ask > 0: return (bid + ask) / 2.0
-                if last and last > 0: return last
-                return None
-
-            if provider == QuoteProvider.Tradier and requests:
-                r = requests.get(
-                    "https://api.tradier.com/v1/markets/options/chains",
-                    params={"symbol": ticker, "expiration": expiry.strftime("%Y-%m-%d"), "greeks": "false"},
-                    headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"},
-                    timeout=10
-                ); r.raise_for_status()
-                items = r.json().get("options", {}).get("option", [])
-                if not items: return None
-                filt = [x for x in items if x.get("option_type","").upper().startswith("C" if kind=="C" else "P")]
-                nearest = min(filt, key=lambda x: abs(float(x["strike"]) - strike), default=None)
-                if not nearest: return None
-                bid = _safe_float(nearest.get("bid")); ask = _safe_float(nearest.get("ask")); last = _safe_float(nearest.get("last"))
-                if bid and ask and ask > 0: return (bid + ask) / 2.0
-                if last and last > 0: return last
-                return None
-
+        exps = exps.copy(); exps["d"] = pd.to_datetime(exps["strike_time"]).dt.date
+        want = min(exps["d"], key=lambda d: abs((d - expiry).days))
+        ret, chain = ctx.get_option_chain(code=code, start=want.strftime("%Y-%m-%d"), end=want.strftime("%Y-%m-%d"))
+        if ret != RET_OK or chain is None or chain.empty:
             return None
-        except Exception:
+        tbl = chain.copy()
+        tbl["strike_price"] = tbl["strike_price"].astype(float)
+        tbl["option_type"] = tbl["option_type"].astype(str).str.upper().str[0]
+        side = "C" if kind.upper().startswith("C") else "P"
+        cands = tbl[tbl["option_type"] == side]
+        if cands.empty:
             return None
+        row = cands.iloc[(cands["strike_price"] - float(strike)).abs().argsort()[:1]]
+        opt_code = row["code"].iloc[0]
+        ret, _ = ctx.subscribe(opt_code, SubType.QUOTE, push=False)
+        if ret != RET_OK:
+            return None
+        ret, q = ctx.get_stock_quote(opt_code)
+        if ret != RET_OK or q is None or q.empty:
+            return None
+        bid = q["bid_price"].iloc[0] if "bid_price" in q.columns else np.nan
+        ask = q["ask_price"].iloc[0] if "ask_price" in q.columns else np.nan
+        last = q["last_price"].iloc[0] if "last_price" in q.columns else np.nan
+        if pd.notna(bid) and pd.notna(ask) and float(ask) > 0:
+            return (float(bid) + float(ask)) / 2.0
+        if pd.notna(last) and float(last) > 0:
+            return float(last)
+        return None
+    finally:
+        ctx.close()
 
 # ===================== Streamlit UI =====================
 def st_app():
     st.set_page_config(page_title="Options P/L-at-Expiry", layout="wide")
     st.title("📈 Options P/L-at-Expiry Simulator")
-    st.caption("Upload Moomoo CSV • Build what-ifs • Live quote auto-pricing")
+    st.caption("Default provider: Moomoo/Futu OpenAPI (OpenD). Upload Moomoo CSV • Build what-ifs.")
+
+    if OpenQuoteContext is None:
+        st.warning("OpenAPI SDK not installed. Run: `pip install futu-api`")
 
     uploaded = st.sidebar.file_uploader("Positions CSV", type=["csv"])
     use_sample = st.sidebar.checkbox("Load sample data", value=True)
@@ -371,60 +294,71 @@ def st_app():
     try:
         strategies, legs = parse_moomoo_positions(df)
     except Exception as e:
-        st.error(f"Failed to parse CSV: {e}")
-        st.dataframe(df.head(50))
-        st.stop()
+        st.error(f"Failed to parse CSV: {e}"); st.dataframe(df.head(50)); st.stop()
 
     tickers = sorted({l.ticker for l in legs}) or ["NVDA"]
 
-    # Provider
     st.sidebar.header("Quotes Provider")
     provider = st.sidebar.selectbox("Provider",
-        [QuoteProvider.Yahoo, QuoteProvider.Tradier, QuoteProvider.Polygon, QuoteProvider.Moomoo], index=0)
-    tradier_token = st.sidebar.text_input("Tradier Token", type="password") if provider==QuoteProvider.Tradier else ""
-    polygon_key  = st.sidebar.text_input("Polygon API Key", type="password") if provider==QuoteProvider.Polygon else ""
-    moomoo_cookie= st.sidebar.text_input("Moomoo Cookie (custom)", type="password") if provider==QuoteProvider.Moomoo else ""
+        [QuoteProvider.Moomoo, QuoteProvider.Tradier, QuoteProvider.Polygon], index=0)
 
-    # Spots
+    mm_host = st.sidebar.text_input("OpenD Host", value="127.0.0.1") if provider == QuoteProvider.Moomoo else ""
+    mm_port = st.sidebar.number_input("OpenD Quote Port", value=11111, step=1) if provider == QuoteProvider.Moomoo else 0
+    tradier_token = st.sidebar.text_input("Tradier Token", type="password") if provider == QuoteProvider.Tradier else ""
+    polygon_key  = st.sidebar.text_input("Polygon API Key", type="password") if provider == QuoteProvider.Polygon else ""
+
     st.sidebar.header("Underlying Spot Prices")
     spot_inputs: Dict[str, float] = {}
     for tk in tickers:
         if f"spot_{tk}" not in st.session_state:
             ks = [l.strike for l in legs if l.ticker == tk]
             st.session_state[f"spot_{tk}"] = float(np.median(ks)) if ks else 500.0
-
         spot_inputs[tk] = st.sidebar.number_input(
             f"{tk} spot", min_value=0.0, value=float(st.session_state[f"spot_{tk}"]), step=1.0, key=f"spot_{tk}"
         )
-
         if st.sidebar.button(f"Fetch {tk} spot", key=f"btn_spot_{tk}"):
-            price, source = fetch_spot(provider, tk, api_key=(tradier_token or polygon_key), moomoo_cookie=moomoo_cookie)
-            if price is not None:
-                st.session_state[f"spot_{tk}"] = float(price)
-                st.sidebar.success(f"{tk}: {price:.2f} • {source}")
-                st.experimental_rerun()
+            fetched = None
+            if provider == QuoteProvider.Moomoo and OpenQuoteContext is not None:
+                try:
+                    fetched = moomoo_fetch_spot(tk, mm_host, int(mm_port))
+                except Exception as e:
+                    st.sidebar.warning(f"Moomoo error: {e}")
+            elif provider == QuoteProvider.Tradier and requests:
+                try:
+                    r = requests.get("https://api.tradier.com/v1/markets/quotes",
+                                     params={"symbols": tk},
+                                     headers={"Authorization": f"Bearer {tradier_token}", "Accept": "application/json"},
+                                     timeout=8); r.raise_for_status()
+                    fetched = float(r.json()["quotes"]["quote"]["last"])
+                except Exception as e:
+                    st.sidebar.warning(f"Tradier error: {e}")
+            elif provider == QuoteProvider.Polygon and requests:
+                try:
+                    r = requests.get(f"https://api.polygon.io/v2/last/trade/{tk}",
+                                     params={"apiKey": polygon_key}, timeout=8); r.raise_for_status()
+                    fetched = float(r.json()["results"]["p"])
+                except Exception as e:
+                    st.sidebar.warning(f"Polygon error: {e}")
+            if fetched:
+                st.session_state[f"spot_{tk}"] = float(fetched); st.experimental_rerun()
             else:
-                st.sidebar.info(f"{tk}: live price unavailable ({source}). Using current value {st.session_state[f'spot_{tk}']:.2f}.")
+                st.sidebar.info(f"{tk}: live price unavailable. Using {st.session_state[f'spot_{tk}']:.2f}.")
 
-    # Grid
     st.sidebar.header("Price Grid")
     pct   = st.sidebar.slider("Grid width (±%)", 5, 80, 50, 5) / 100.0
     steps = st.sidebar.slider("Grid steps", 101, 801, 401, 50)
 
-    # Current
     st.header("Current Strategies (from CSV)")
     for s in strategies:
         s.enabled = st.checkbox(s.name, True, key=f"cur_{s.name}")
     with st.expander("Show strategy details"):
         for s in strategies: st.text(s.describe())
 
-    # Builders
     st.header("Add What-If Strategies")
     with st.expander("Builder"):
         tabs = st.tabs(["Single","Vertical","Iron Condor","Iron Butterfly","Strangle/Straddle"])
         what_if: List[Strategy] = st.session_state.get("what_if", [])
 
-        # Single
         with tabs[0]:
             tk   = st.selectbox("Ticker", options=tickers, key="single_tk")
             exp  = st.date_input("Expiry", value=dt.date.today()+dt.timedelta(days=7), key="single_exp")
@@ -434,13 +368,19 @@ def st_app():
             price_key = "single_price"
             _ = st.number_input("Premium per contract", min_value=0.0, value=1.0, step=0.05, key=price_key)
             if st.button("Auto price from API", key="single_auto"):
-                prem = fetch_option_mid(provider, tk, exp, kind, strike, api_key=(tradier_token or polygon_key), moomoo_cookie=moomoo_cookie)
-                if prem is not None: st.session_state[price_key] = float(prem); st.experimental_rerun()
-                else: st.warning("No quote found for that maturity/strike.")
+                prem = None
+                if provider == QuoteProvider.Moomoo and OpenQuoteContext is not None:
+                    try:
+                        prem = moomoo_fetch_option_mid(tk, exp, kind, float(strike), mm_host, int(mm_port))
+                    except Exception as e:
+                        st.warning(f"Moomoo error: {e}")
+                if prem is not None:
+                    st.session_state[price_key] = float(prem); st.experimental_rerun()
+                else:
+                    st.warning("No quote found for that maturity/strike.")
             if st.button("➕ Add Single"):
                 what_if.append(build_single(tk,exp,kind,float(strike),int(qty),float(st.session_state[price_key]))); st.success("Added Single")
 
-        # Vertical
         with tabs[1]:
             tk   = st.selectbox("Ticker", options=tickers, key="vert_tk")
             exp  = st.date_input("Expiry", value=dt.date.today()+dt.timedelta(days=7), key="vert_exp")
@@ -450,17 +390,23 @@ def st_app():
             qty = st.number_input("Contracts (abs)", value=1, step=1, key="vert_qty")
             credit_key = "vert_credit"; _ = st.number_input("Net credit (per contract)", min_value=0.0, value=1.0, step=0.05, key=credit_key)
             if st.button("Auto price from API", key="vert_auto"):
-                short_mid = fetch_option_mid(provider, tk, exp, kind, float(s1), api_key=(tradier_token or polygon_key), moomoo_cookie=moomoo_cookie)
-                long_mid  = fetch_option_mid(provider, tk, exp, kind, float(s2), api_key=(tradier_token or polygon_key), moomoo_cookie=moomoo_cookie)
-                if short_mid is not None and long_mid is not None: st.session_state[credit_key] = max(0.0, float(short_mid - long_mid)); st.experimental_rerun()
-                else: st.warning("Could not fetch both legs.")
+                short_mid = long_mid = None
+                if provider == QuoteProvider.Moomoo and OpenQuoteContext is not None:
+                    try:
+                        short_mid = moomoo_fetch_option_mid(tk, exp, kind, float(s1), mm_host, int(mm_port))
+                        long_mid  = moomoo_fetch_option_mid(tk, exp, kind, float(s2), mm_host, int(mm_port))
+                    except Exception as e:
+                        st.warning(f"Moomoo error: {e}")
+                if short_mid is not None and long_mid is not None:
+                    st.session_state[credit_key] = max(0.0, float(short_mid - long_mid)); st.experimental_rerun()
+                else:
+                    st.warning("Could not fetch both legs.")
             if st.button("➕ Add Vertical"):
                 ss, ls = float(s1), float(s2)
                 if kind == "P" and ls > ss: ls, ss = ss, ls
                 if kind == "C" and ss > ls: ls, ss = ss, ls
                 what_if.append(build_vertical(tk,exp,kind,ss,ls,int(qty),float(st.session_state[credit_key]))); st.success("Added Vertical")
 
-        # Iron Condor
         with tabs[2]:
             tk = st.selectbox("Ticker", options=tickers, key="ic_tk")
             exp = st.date_input("Expiry", value=dt.date.today()+dt.timedelta(days=7), key="ic_exp")
@@ -471,52 +417,61 @@ def st_app():
             qty = st.number_input("Contracts (abs)", value=1, step=1, key="ic_qty")
             credit_key = "ic_credit"; _ = st.number_input("Net credit (per contract)", min_value=0.0, value=1.0, step=0.05, key=credit_key)
             if st.button("Auto price from API", key="ic_auto"):
-                pm  = fetch_option_mid(provider, tk, exp, "P", float(sp), api_key=(tradier_token or polygon_key), moomoo_cookie=moomoo_cookie)
-                plm = fetch_option_mid(provider, tk, exp, "P", float(lp), api_key=(tradier_token or polygon_key), moomoo_cookie=moomoo_cookie)
-                cm  = fetch_option_mid(provider, tk, exp, "C", float(sc), api_key=(tradier_token or polygon_key), moomoo_cookie=moomoo_cookie)
-                clm = fetch_option_mid(provider, tk, exp, "C", float(lc), api_key=(tradier_token or polygon_key), moomoo_cookie=moomoo_cookie)
-                if all(x is not None for x in [pm, plm, cm, clm]): st.session_state[credit_key] = max(0.0, float((pm - plm) + (cm - clm))); st.experimental_rerun()
-                else: st.warning("Missing one or more legs from API.")
+                pm  = plm = cm = clm = None
+                if provider == QuoteProvider.Moomoo and OpenQuoteContext is not None:
+                    try:
+                        pm  = moomoo_fetch_option_mid(tk, exp, "P", float(sp), mm_host, int(mm_port))
+                        plm = moomoo_fetch_option_mid(tk, exp, "P", float(lp), mm_host, int(mm_port))
+                        cm  = moomoo_fetch_option_mid(tk, exp, "C", float(sc), mm_host, int(mm_port))
+                        clm = moomoo_fetch_option_mid(tk, exp, "C", float(lc), mm_host, int(mm_port))
+                    except Exception as e:
+                        st.warning(f"Moomoo error: {e}")
+                if all(x is not None for x in [pm, plm, cm, clm]):
+                    st.session_state[credit_key] = max(0.0, float((pm - plm) + (cm - clm))); st.experimental_rerun()
+                else:
+                    st.warning("Missing one or more legs from API.")
             if st.button("➕ Add Iron Condor"):
                 what_if.append(build_iron_condor(tk,exp,float(sp),float(lp),float(sc),float(lc),int(qty),float(st.session_state[credit_key]))); st.success("Added Iron Condor")
 
-        # Iron Butterfly (+ Snap to market)
         with tabs[3]:
             tk = st.selectbox("Ticker", options=tickers, key="ib_tk")
             exp = st.date_input("Expiry", value=dt.date.today()+dt.timedelta(days=7), key="ib_exp")
             center = st.number_input("Center strike (short straddle)", min_value=0.0, value=float(round(spot_inputs.get(tk,500.0))), step=1.0, key="ib_center")
             width  = st.number_input("Wing width", min_value=0.0, value=5.0, step=0.5, key="ib_width")
-
-            step_choice = st.selectbox("Snap width to", options=[1.0, 2.5, 5.0, 10.0], index=2, key="ib_step")
             if st.button("🔧 Snap to market", key="ib_snap"):
-                strikes = get_available_strikes(provider, tk, exp, api_key=(tradier_token or polygon_key), moomoo_cookie=moomoo_cookie)
+                strikes = []
+                if provider == QuoteProvider.Moomoo and OpenQuoteContext is not None:
+                    try:
+                        strikes = moomoo_get_available_strikes(tk, exp, mm_host, int(mm_port))
+                    except Exception as e:
+                        st.warning(f"Moomoo error: {e}")
                 if strikes:
                     nearest_center = min(strikes, key=lambda s: abs(s - float(st.session_state["ib_center"])))
-                    st.session_state["ib_center"] = float(nearest_center)
-                    step = float(step_choice)
-                    snapped_width = max(step, round(float(st.session_state["ib_width"]) / step) * step)
-                    st.session_state["ib_width"] = float(snapped_width)
-                    st.experimental_rerun()
+                    st.session_state["ib_center"] = float(nearest_center); st.experimental_rerun()
                 else:
                     st.warning("Could not load market strikes to snap.")
-
             put_wing  = float(max(0.0, st.session_state["ib_center"] - st.session_state["ib_width"]))
             call_wing = float(st.session_state["ib_center"] + st.session_state["ib_width"])
             st.write(f"Wings ⇢ Put {put_wing:g}, Call {call_wing:g}")
-
             qty = st.number_input("Contracts (abs)", value=1, step=1, key="ib_qty")
             credit_key = "ib_credit"; _ = st.number_input("Net credit (per contract)", min_value=0.0, value=1.0, step=0.05, key=credit_key)
             if st.button("Auto price from API", key="ib_auto"):
-                pm  = fetch_option_mid(provider, tk, exp, "P", st.session_state["ib_center"], api_key=(tradier_token or polygon_key), moomoo_cookie=moomoo_cookie)
-                cm  = fetch_option_mid(provider, tk, exp, "C", st.session_state["ib_center"], api_key=(tradier_token or polygon_key), moomoo_cookie=moomoo_cookie)
-                plm = fetch_option_mid(provider, tk, exp, "P", put_wing, api_key=(tradier_token or polygon_key), moomoo_cookie=moomoo_cookie)
-                clm = fetch_option_mid(provider, tk, exp, "C", call_wing, api_key=(tradier_token or polygon_key), moomoo_cookie=moomoo_cookie)
-                if all(x is not None for x in [pm, cm, plm, clm]): st.session_state[credit_key] = max(0.0, float((pm + cm) - (plm + clm))); st.experimental_rerun()
-                else: st.warning("Missing one or more legs from API.")
+                pm = cm = plm = clm = None
+                if provider == QuoteProvider.Moomoo and OpenQuoteContext is not None:
+                    try:
+                        pm  = moomoo_fetch_option_mid(tk, exp, "P", st.session_state["ib_center"], mm_host, int(mm_port))
+                        cm  = moomoo_fetch_option_mid(tk, exp, "C", st.session_state["ib_center"], mm_host, int(mm_port))
+                        plm = moomoo_fetch_option_mid(tk, exp, "P", put_wing, mm_host, int(mm_port))
+                        clm = moomoo_fetch_option_mid(tk, exp, "C", call_wing, mm_host, int(mm_port))
+                    except Exception as e:
+                        st.warning(f"Moomoo error: {e}")
+                if all(x is not None for x in [pm, cm, plm, clm]):
+                    st.session_state[credit_key] = max(0.0, float((pm + cm) - (plm + clm))); st.experimental_rerun()
+                else:
+                    st.warning("Missing one or more legs from API.")
             if st.button("➕ Add Iron Butterfly"):
                 what_if.append(build_iron_butterfly(tk,exp,float(st.session_state["ib_center"]),float(put_wing),float(call_wing),int(qty),float(st.session_state[credit_key]))); st.success("Added Iron Butterfly")
 
-        # Strangle/Straddle
         with tabs[4]:
             tk = st.selectbox("Ticker", options=tickers, key="sg_tk")
             exp = st.date_input("Expiry", value=dt.date.today()+dt.timedelta(days=7), key="sg_exp")
@@ -525,16 +480,21 @@ def st_app():
             qty = st.number_input("Contracts (abs)", value=1, step=1, key="sg_qty")
             credit_key = "sg_credit"; _ = st.number_input("Net credit (>0 short, 0 for long)", min_value=0.0, value=1.0, step=0.05, key=credit_key)
             if st.button("Auto price from API", key="sg_auto"):
-                pm = fetch_option_mid(provider, tk, exp, "P", float(put_k),  api_key=(tradier_token or polygon_key), moomoo_cookie=moomoo_cookie)
-                cm = fetch_option_mid(provider, tk, exp, "C", float(call_k), api_key=(tradier_token or polygon_key), moomoo_cookie=moomoo_cookie)
-                if pm is not None and cm is not None: st.session_state[credit_key] = max(0.0, float(pm + cm)); st.experimental_rerun()
-                else: st.warning("Could not price both legs.")
+                pm = cm = None
+                if provider == QuoteProvider.Moomoo and OpenQuoteContext is not None:
+                    try:
+                        pm = moomoo_fetch_option_mid(tk, exp, "P", float(put_k),  mm_host, int(mm_port))
+                        cm = moomoo_fetch_option_mid(tk, exp, "C", float(call_k), mm_host, int(mm_port))
+                    except Exception as e:
+                        st.warning(f"Moomoo error: {e}")
+                if pm is not None and cm is not None:
+                    st.session_state[credit_key] = max(0.0, float(pm + cm)); st.experimental_rerun()
+                else:
+                    st.warning("Could not price both legs.")
             if st.button("➕ Add Strangle/Straddle"):
                 what_if.append(build_strangle(tk,exp,float(put_k),float(call_k),int(qty),float(st.session_state[credit_key]))); st.success("Added Strangle/Straddle")
-
         st.session_state["what_if"] = what_if
 
-    # Charts
     st.header("P/L at Expiry (per Ticker)")
     for tk in tickers:
         xs = price_grid(st.session_state[f"spot_{tk}"], pct, steps)
@@ -548,15 +508,11 @@ def st_app():
         fig.update_layout(height=400, xaxis_title="Underlying at Expiry", yaxis_title="P/L (USD)")
         st.plotly_chart(fig, use_container_width=True)
 
-    # Portfolio (approx per first ticker)
     st.header("Portfolio (Combined)")
-    tk0 = tickers[0]
-    xs = price_grid(st.session_state[f"spot_{tk0}"], pct, steps)
+    tk0 = tickers[0]; xs = price_grid(st.session_state[f"spot_{tk0}"], pct, steps)
     def agg(strats: List[Strategy]) -> np.ndarray:
         return sum(strategy_pl_curve(s, xs, tk0) for s in strats if s.enabled and tk0 in s.tickers())
-    current = agg(strategies)
-    added   = agg(st.session_state.get("what_if", []))
-    comb    = current + added
+    current = agg(strategies); added = agg(st.session_state.get("what_if", [])); comb = current + added
     fig2 = go.Figure()
     fig2.add_trace(go.Scatter(x=xs, y=current, name="Current"))
     fig2.add_trace(go.Scatter(x=xs, y=comb, name="Current + What-If"))
@@ -580,15 +536,13 @@ def main():
     parser.add_argument("--run-tests", action="store_true")
     args, _ = parser.parse_known_args()
     if args.run_tests:
-        # quick sanity
         leg = OptionLeg("ABC", dt.date(2025,1,1), "C", 100, +1, 2.0)
         assert math.isclose(leg.payoff_at_expiry(120), 1800.0)
-        df = sample_positions_df()
-        parse_moomoo_positions(df)
-        print("Tests OK")
-        return
+        strategies, legs = parse_moomoo_positions(sample_positions_df())
+        assert len(legs) == 2
+        print("Tests OK"); return
     if st is None:
-        print("Install: pip install streamlit plotly pandas numpy yfinance requests")
+        print("Install: pip install streamlit plotly pandas numpy requests futu-api")
         print("Run: streamlit run option_pl_simulator.py"); return
     st_app()
 
